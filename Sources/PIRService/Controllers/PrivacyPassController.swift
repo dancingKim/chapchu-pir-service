@@ -25,34 +25,31 @@ struct PrivacyPassController {
         group.post("/issue", use: issueToken)
     }
 
-    func authenticateUserToken(request: Request) async throws {
-        guard let userToken = request.headers.bearerToken,
-              await state.authenticate(userToken: userToken)
-        else {
+    func authenticatedIssuer(request: Request) async throws -> PrivacyPass.Issuer {
+        guard let token = request.headers.bearerToken, let issuer = await state.issuer(for: token) else {
             throw HTTPError(.unauthorized, message: "User token is unauthorized")
         }
+        return issuer
     }
 
     @Sendable
     func tokenIssuerDirectory(request _: Request, context _: AppContext) async throws -> TokenIssuerDirectory {
-        let spki = try state.issuer.privateKey.publicKey.spki()
-        let tokenKey = TokenIssuerDirectory.TokenKey(
-            tokenType: PrivacyPass.TokenTypeBlindRSA,
-            tokenKeyBase64Url: spki.base64URLEncodedString(),
-            notBefore: nil)
-        let issuerRequestUri = URL(string: "/issue")!
-        return TokenIssuerDirectory(issuerRequestUri: issuerRequestUri, tokenKeys: [tokenKey])
+        let keys = try await state.directoryIssuers().map { issuer in
+            try TokenIssuerDirectory.TokenKey(tokenType: PrivacyPass.TokenTypeBlindRSA,
+                                              tokenKeyBase64Url: issuer.publicKey.spki().base64URLEncodedString(),
+                                              notBefore: nil)
+        }
+        return TokenIssuerDirectory(issuerRequestUri: URL(string: "/issue")!, tokenKeys: keys)
     }
 
     @Sendable
     func tokenKeyForUserToken(request: Request, context _: AppContext) async throws -> PrivacyPass.PublicKey {
-        try await authenticateUserToken(request: request)
-        return state.issuer.publicKey
+        try await authenticatedIssuer(request: request).publicKey
     }
 
     @Sendable
     func issueToken(request: Request, context _: AppContext) async throws -> PrivacyPass.TokenResponse {
-        try await authenticateUserToken(request: request)
+        let issuer = try await authenticatedIssuer(request: request)
         // decode tokenRequest
         var tokenRequestByteBuffer = try await request.body.collect(upTo: PrivacyPass.TokenRequest.sizeInBytes)
         guard let tokenRequestBytes = tokenRequestByteBuffer.readBytes(length: PrivacyPass.TokenRequest.sizeInBytes)
@@ -60,6 +57,6 @@ struct PrivacyPassController {
             throw PrivacyPass.PrivacyPassError(code: .invalidTokenRequestSize)
         }
         let tokenRequest = try PrivacyPass.TokenRequest(from: tokenRequestBytes)
-        return try state.issuer.issue(request: tokenRequest)
+        return try issuer.issue(request: tokenRequest)
     }
 }

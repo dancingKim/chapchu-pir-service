@@ -108,6 +108,9 @@ struct PirUsecase<PirScheme: IndexPirServer>: Usecase {
         guard !pirRequest.hasShardID else {
             throw HTTPError(.notImplemented, message: "overloading shard index with ShardID is not supported")
         }
+        guard Int(pirRequest.shardIndex) < shards.count else { throw HTTPError(
+            .badRequest,
+            message: "Invalid shard index") }
         let shard = shards[Int(pirRequest.shardIndex)]
         let query: KeywordPirServer<PirScheme>.Query = try pirRequest.query.native(context: context)
         let evaluationKey: EvaluationKey<Scheme> = try evaluationKey.evaluationKey.native(context: context)

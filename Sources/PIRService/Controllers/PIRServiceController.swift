@@ -22,9 +22,23 @@ import Util
 struct PIRServiceController {
     let usecases: UsecaseStore
     let evaluationKeyStore: PersistDriver
+    var privacyPassState: PrivacyPassState?
 
-    static func persistKey(user: UserIdentifier, configHash: Data) -> String {
-        "\(user.identifier)/\(configHash.base64EncodedString())"
+    static func persistKey(user: UserIdentifier, configHash: Data, policyID: String = "") -> String {
+        let base = "\(user.identifier)/\(configHash.base64EncodedString())"
+        return policyID.isEmpty ? base : "policy/" + PolicyUsecase.digest([
+            Data(policyID.utf8),
+            Data(user.identifier.utf8),
+            configHash,
+        ]).base64EncodedString()
+    }
+
+    private func requireSupportedPolicyPlatform(_ context: AppContext) throws {
+        if !context.policyID.isEmpty {
+            guard context.platform?.osType == .iOS, context.platform?.osVersion.major == 26 else {
+                throw HTTPError(.notImplemented, message: "Policy routing supports iOS 26 only")
+            }
+        }
     }
 
     func addRoutes(to group: RouterGroup<AppContext>) {
@@ -45,6 +59,7 @@ struct PIRServiceController {
 
     @Sendable
     func key(_ request: Request, context: AppContext) async throws -> Response {
+        try requireSupportedPolicyPlatform(context)
         let evaluationKeys = try await request.decodeProto(
             as: Apple_SwiftHomomorphicEncryption_Api_Shared_V1_EvaluationKeys.self,
             context: context)
@@ -53,7 +68,15 @@ struct PIRServiceController {
                 throw HTTPError(.badRequest, message: "Evaluation key has unset fields")
             }
 
-            let key = Self.persistKey(user: context.userIdentifier, configHash: evaluationKey.metadata.identifier)
+            if !context.policyID.isEmpty,
+               try await !usecases.acceptsKey(evaluationKey.metadata.identifier, policyID: context.policyID)
+            {
+                throw HTTPError(.badRequest, message: "Unknown evaluation key configuration")
+            }
+            let key = Self.persistKey(
+                user: context.userIdentifier,
+                configHash: evaluationKey.metadata.identifier,
+                policyID: context.policyID)
             try await evaluationKeyStore.set(key: key, value: Protobuf(evaluationKey))
         }
         return .init(status: .ok)
@@ -61,13 +84,17 @@ struct PIRServiceController {
 
     @Sendable
     func config(_ request: Request, context: AppContext) async throws -> some ResponseGenerator {
+        try requireSupportedPolicyPlatform(context)
         let configRequest = try await request.decodeProto(
             as: Apple_SwiftHomomorphicEncryption_Api_Pir_V1_ConfigRequest.self,
             context: context)
+        guard Set(configRequest.usecases).count == configRequest.usecases.count else {
+            throw HTTPError(.badRequest, message: "Duplicate usecase names")
+        }
         let requestedUsecases = if configRequest.usecases.isEmpty {
-            await usecases.getAll()
+            await usecases.getAll(policyID: context.policyID)
         } else {
-            await usecases.get(names: configRequest.usecases)
+            await usecases.get(names: configRequest.usecases, policyID: context.policyID)
         }
 
         guard configRequest.existingConfigIds.isEmpty ||
@@ -84,15 +111,16 @@ struct PIRServiceController {
         else {
             throw await HTTPError(.notFound, message: """
                 One or more usecases not found. Requested usecases: \(configRequest.usecases).
-                Usecases available on the server: \(usecases.getAll().keys).
+                Usecases available on the server: \(usecases.getAll(policyID: context.policyID).keys).
                 """)
         }
 
+        let usecaseNames = configRequest.usecases.isEmpty ? requestedUsecases.keys.sorted() : configRequest.usecases
         let existingConfigIds = configRequest.existingConfigIds.isEmpty ? Array(
             repeating: Data(),
             count: requestedUsecases.count) : configRequest.existingConfigIds
         var configs = [String: Apple_SwiftHomomorphicEncryption_Api_Pir_V1_Config]()
-        for (usecaseName, configId) in zip(requestedUsecases.keys, existingConfigIds) {
+        for (usecaseName, configId) in zip(usecaseNames, existingConfigIds) {
             if let usecase = requestedUsecases[usecaseName] {
                 var config = try usecase.config(existingConfigId: Array(configId))
                 if let platform = context.platform {
@@ -105,7 +133,10 @@ struct PIRServiceController {
         let keyConfigs = try requestedUsecases.values.map { try $0.evaluationKeyConfig() }
         let keyStatusesSequence = keyConfigs.async.map { keyConfig in
             let keyConfigHash = try keyConfig.sha256()
-            let key = Self.persistKey(user: context.userIdentifier, configHash: keyConfigHash)
+            let key = Self.persistKey(
+                user: context.userIdentifier,
+                configHash: keyConfigHash,
+                policyID: context.policyID)
             let storedEvaluationKey = try await evaluationKeyStore.get(
                 key: key,
                 as: Protobuf<Apple_SwiftHomomorphicEncryption_Api_Shared_V1_EvaluationKey>.self)
@@ -125,8 +156,11 @@ struct PIRServiceController {
     }
 
     @Sendable
-    func getConfig(_: Request, context _: AppContext) async throws -> some ResponseGenerator {
-        let allUsecases = await usecases.getAll()
+    func getConfig(_: Request, context: AppContext) async throws -> some ResponseGenerator {
+        guard await privacyPassState?.policyIsolation != true else {
+            throw HTTPError(.notImplemented, message: "Anonymous configuration is unavailable for isolated policies")
+        }
+        let allUsecases = await usecases.getAll(policyID: context.policyID)
         let configs = try Dictionary(uniqueKeysWithValues: allUsecases.map { name, usecase in
             try (name, usecase.config(existingConfigId: []))
         })
@@ -144,6 +178,7 @@ struct PIRServiceController {
 
     @Sendable
     func queries(_ request: Request, context: AppContext) async throws -> some ResponseGenerator {
+        try requireSupportedPolicyPlatform(context)
         let startTime = Date.now
         let requests = try await request.decodeProto(
             as: Apple_SwiftHomomorphicEncryption_Api_Pir_V1_Requests.self,
@@ -151,13 +186,13 @@ struct PIRServiceController {
 
         defer {
             let duration = Date.now.timeIntervalSince(startTime)
-            context.logger.info("usecase=\(requests.requests.map(\.usecase)), duration=\(duration * 1000)ms")
+            context.logger.info("PIR query completed", metadata: ["durationMs": .stringConvertible(duration * 1000)])
         }
 
-        let responsesSequence = requests.requests.async.map { request in
+        let responsesSequence = requests.requests.async.map { request in // swiftlint:disable:this closure_body_length
             switch request.request {
             case let .oprfRequest(oprfRequest):
-                guard let usecase = await usecases.get(name: request.usecase) else {
+                guard let usecase = await usecases.get(name: request.usecase, policyID: context.policyID) else {
                     throw HTTPError(.badRequest, message: "Unknown usecase: \(request.usecase)")
                 }
                 return try await usecase.processOprf(request: oprfRequest)
@@ -169,7 +204,7 @@ struct PIRServiceController {
                     let evaluationKeyConfigHash = request.pirRequest.evaluationKeyMetadata.identifier
                     let evaluationKeyStoreKey = Self.persistKey(
                         user: context.userIdentifier,
-                        configHash: evaluationKeyConfigHash)
+                        configHash: evaluationKeyConfigHash, policyID: context.policyID)
                     evaluationKey = try await evaluationKeyStore.get(
                         key: evaluationKeyStoreKey,
                         as: Protobuf<Apple_SwiftHomomorphicEncryption_Api_Shared_V1_EvaluationKey>.self)?.message
@@ -180,14 +215,19 @@ struct PIRServiceController {
                 let configId = Array(request.pirRequest.configurationHash)
                 guard let usecase = await usecases.get(
                     name: request.usecase,
-                    configId: configId)
+                    configId: configId, policyID: context.policyID)
                 else {
-                    if await (usecases.get(name: request.usecase)) != nil {
+                    if await (usecases.get(name: request.usecase, policyID: context.policyID)) != nil {
                         throw HTTPError(
                             .gone,
                             message: "Configuration id: \(configId) is not available for usecase \(request.usecase).")
                     }
                     throw HTTPError(.badRequest, message: "Unknown usecase: \(request.usecase)")
+                }
+                if !context.policyID.isEmpty,
+                   try evaluationKey.metadata.identifier != usecase.evaluationKeyConfig().sha256()
+                {
+                    throw HTTPError(.badRequest, message: "Evaluation key configuration mismatch")
                 }
                 return try await usecase.process(request: request, evaluationKey: evaluationKey)
             case .none:
