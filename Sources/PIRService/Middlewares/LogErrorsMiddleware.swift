@@ -24,10 +24,10 @@ struct LogErrorsMiddleware<Context: RequestContext>: RouterMiddleware {
         do {
             return try await next(input, context)
         } catch let error as HTTPError {
-            context.logger.error("\(error)")
+            context.logger.error("Request rejected", metadata: ["status": .stringConvertible(error.status.code)])
             throw error
         } catch {
-            context.logger.error("\(error.localizedDescription)")
+            context.logger.error("Request failed")
             throw error
         }
     }

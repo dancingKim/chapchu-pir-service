@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import Foundation
 import HomomorphicEncryption
 import PrivateInformationRetrieval
 
@@ -69,17 +70,19 @@ actor UsecaseStore {
         }
     }
 
-    var store: [String: VersionedUsecases]
+    struct Namespace: Hashable { let policyID: String; let name: String }
+    var store: [Namespace: VersionedUsecases]
 
     var allUsecaseNames: [String] {
-        .init(store.keys)
+        .init(store.keys.filter(\.policyID.isEmpty).map(\.name))
     }
 
     init() {
         self.store = [:]
     }
 
-    func set(name: String, usecase: Usecase?, versionCount: Int = 2) throws {
+    func set(name: String, usecase: Usecase?, versionCount: Int = 2, policyID: String = "") throws {
+        let name = Namespace(policyID: policyID, name: name)
         if let usecase {
             try store[name, default: .init(versionCount: versionCount)].add(
                 usecase: usecase,
@@ -89,26 +92,57 @@ actor UsecaseStore {
         }
     }
 
-    func get(name: String, configId: ConfigId) -> Usecase? {
-        store[name]?.usecases[configId]
+    func get(name: String, configId: ConfigId, policyID: String = "") -> Usecase? {
+        store[Namespace(policyID: policyID, name: name)]?.usecases[configId]
     }
 
-    func get(name: String) -> Usecase? {
-        store[name]?.usecase
+    func get(name: String, policyID: String = "") -> Usecase? {
+        store[Namespace(policyID: policyID, name: name)]?.usecase
     }
 
-    func get(names: [String]) -> [String: Usecase] {
+    func get(names: [String], policyID: String = "") -> [String: Usecase] {
         .init(uniqueKeysWithValues: names.compactMap { name in
-            guard let usecase = store[name]?.usecase else {
+            guard let usecase = store[Namespace(policyID: policyID, name: name)]?.usecase else {
                 return nil
             }
             return (name, usecase)
         })
     }
 
-    func getAll() -> [String: Usecase] {
-        store.compactMapValues { versionedUsecases in
-            versionedUsecases.usecase
+    func getAll(policyID: String = "") -> [String: Usecase] {
+        Dictionary(uniqueKeysWithValues: store.compactMap { key, versions in
+            guard key.policyID == policyID, let usecase = versions.usecase else {
+                return nil
+            }
+            return (key.name, usecase)
+        })
+    }
+
+    func acceptsKey(_ hash: Data, policyID: String) throws -> Bool {
+        try store.filter { $0.key.policyID == policyID }.values.contains { versions in
+            try versions.usecases.values.contains { try $0.evaluationKeyConfig().sha256() == hash }
         }
+    }
+
+    /// Build a complete snapshot first. A failed revision collision leaves every policy untouched.
+    func installPolicies(_ entries: [PolicyDataset]) throws {
+        var staged = store
+        let names = Set(entries.map { Namespace(policyID: $0.policyID, name: $0.name) })
+        staged = staged.filter { names.contains($0.key) }
+        for entry in entries {
+            let key = Namespace(policyID: entry.policyID, name: entry.name)
+            if let previous = staged[key] {
+                for old in previous.usecases.values {
+                    if let old = old as? PolicyUsecase, old.revision == entry.usecase.revision,
+                       old.contentIdentity != entry.usecase.contentIdentity
+                    {
+                        throw PolicyConfigurationError.invalid
+                    }
+                }
+            }
+            try staged[key, default: .init(versionCount: entry.versionCount)].add(
+                usecase: entry.usecase, versionCount: entry.versionCount)
+        }
+        store = staged
     }
 }

@@ -1,3 +1,150 @@
+# Chapchu policy-isolated PIR service (Dev candidate)
+
+Fork baseline: Apple `pir-service-example` commit
+`c4ee8609e614151564fd06d8c6a50d69f85d3fc1`. Dependencies remain pinned by
+`Package.resolved`; this fork does not replace the cryptographic implementation.
+
+This implements Guardian #924 U2/U3 server isolation using the existing Apple
+PIRClient, PrivacyPass, and homomorphic-encryption libraries. It is **not an
+Apple-approved distribution architecture** or evidence of filtering on a device.
+The physical probe campaign remains closed. The upstream sample warning below
+still applies.
+
+## iOS 26 policy routing
+
+One service/issuer host can serve separate immutable datasets. The bearer token
+selects a stable issuer key at `/token-key-for-user-token` and `/issue`. Verified
+**full** PrivacyPass key IDs select the same policy for `/config`, `/key`, and
+`/queries`. `User-Identifier` is an OS pseudonym used only inside the selected
+policy's evaluation-key namespace; it is not the Chapchu account ID or policy.
+No requested policy ID, URL, bearer, private key, or request headers are logged.
+Policy-mode `/report` rejects requests instead of collecting plaintext URLs.
+
+Each policy has a stable key and a dedicated persistent nonce journal. Replay is
+rejected across concurrent requests and service restarts. Keep that journal for
+the lifetime of the issuer key. Its file lock permits **one server process**;
+replicated deployment requires a shared atomic nonce store and is not implemented.
+Corrupt journals or a second writer fail closed. A missing journal is initialized
+as new; provisioning/deployment must never delete a journal while reusing its key. The 64 MiB journal bound
+fails closed rather than discarding used nonces. Back up the key and journal
+together; do not restore an older journal while retaining the key. Never reuse a
+policy ID or issuer key for another account/installation.
+
+Policy-specific keys make requests for one policy linkable to each other, and the
+public issuer directory exposes the key set. A per-installation policy can have
+an anonymity set of one. PIR hides the query contents; it does not remove that
+linkability. Apple's permission for per-installation PrivacyPass tiers is still
+unconfirmed and must be resolved before distribution.
+
+The current Apple source describes **upcoming iOS 27.3** changes that remove tier
+selection and introduce anonymous GET `/config`. These are not restrictions that
+already applied to the tested iOS 26 release. This candidate deliberately returns
+501 for anonymous `/config` in policy mode and authenticated PIR requests outside
+iOS 26. There is no fallback to a global dataset. A supported 27.3 replacement and
+any per-profile-host registration rules remain unconfirmed. Existing static
+sample configurations retain their previous API/platform behavior.
+
+### Distribution gate and Apple enquiry
+
+Per-installation linkability is a **distribution/activation blocker pending the
+privacy model and Apple relay approval**, not a blocker to isolated Dev service
+and automated tests. OHTTP does not erase the stable policy-key linkage. Keep
+product activation disabled until that question is resolved; do not describe a
+working HTTPS endpoint or passing tests as permission to activate NEURLFilter.
+
+Ask Apple:
+
+- May NEURLFilter on iOS 26 use a distinct PrivacyPass issuer key per installation
+  at one registered host for an exact custom URL list? Is the resulting policy
+  linkage and public key directory compatible with the required privacy model?
+- What supported policy-selection mechanism replaces tiers with upcoming 27.3's
+  anonymous GET configuration? A single global union changes custom-list verdicts.
+- If distinct service hosts are required, does each need separate relay approval,
+  or is a documented wildcard registration available?
+
+No enquiry is recorded as sent and no answer is assumed.
+
+## External configuration
+
+Start using `swift run --skip-build PIRService --hostname 127.0.0.1 --port 8080 /absolute/config.json`.
+Keep configuration, bearer files, RSA PEM keys, nonce journals, Bloom files, and
+processed PIR artifacts outside the repository. Keys/bearers must have no group
+or other access (0600 or 0400); journal files are 0600. Do not put token/key values
+on command lines. This example contains paths and placeholders only:
+
+```json
+{
+  "tokens": [],
+  "usecases": [],
+  "profiles": [{
+    "id": "opaque-installation-policy-id",
+    "bearerTokenFile": "/run/secrets/policy-bearer",
+    "privateKeyFile": "/run/secrets/policy-issuer.pem",
+    "nonceFile": "/var/lib/chapchu-pir/policy-redemptions.bin",
+    "usecases": [{
+      "name": "URL-filter",
+      "fileStem": "/var/lib/chapchu-pir/revisions/r1/URL-filter",
+      "shardCount": 1,
+      "versionCount": 2,
+      "revision": "r1",
+      "artifactSHA256": "<64 hexadecimal characters>",
+      "bloomFile": "/var/lib/chapchu-pir/revisions/r1/bloom.bin",
+      "bloomSHA256": "<64 hexadecimal characters>"
+    }]
+  }]
+}
+```
+
+The issuer key is an existing RSA private key compatible with upstream
+`PrivacyPass.PrivateKey` (2048-bit Blind RSA); it is never generated by policy
+configuration loading. Use the same id/key/journal on reload and restart.
+Configuration without `profiles` is the original static sample mode. Global
+`tokens`, global `usecases`, and `reportDirectory` cannot be combined with profiles.
+
+`artifactSHA256` is SHA256 over ordered artifact files: for each shard from zero,
+`<fileStem>-<shard>.params.txtpb`, then `<fileStem>-<shard>.bin`. Prefix **each file**
+with its byte length as an unsigned 64-bit big-endian integer. `bloomSHA256` is
+ordinary SHA256 of the Bloom file bytes. The trusted rule compiler must produce
+both from the same canonical URL revision; digest checking binds the artifact
+pair but does not prove the semantic contents of an arbitrary Bloom file.
+
+A configuration ID is length-framed SHA256 over `chapchu-policy-v1`, policy id,
+usecase name, revision, and content identity. Content identity is length-framed
+SHA256 of the artifact digest, Bloom digest, and upstream PIR config ID. Thus
+same-size datasets using identical encryption parameters cannot share a cache
+identity. The rule compiler/native integration must also bind its Bloom tag and
+applied revision to this artifact pair. Client-side cache reset/refresh, policy
+approval, OHTTP transport, entitlement, and Apple registration are separate work.
+
+Stage files under a new immutable revision directory, atomically replace the
+external config, then send SIGHUP. All credentials/artifacts are validated before
+the policy snapshot changes; failures preserve the previous snapshot. A repeated
+revision with different contents is rejected while that revision is retained.
+Keep 1–8 server versions (default 2). Queries carrying a retained config ID use
+that exact dataset; retired/cross-policy IDs are rejected with 410. Retention is
+in memory: a service restart loads the configured current revision and old client
+queries receive 410 until refreshed. Stable policy keys do not change when URLs
+change. Removing a policy revokes its cached tokens. No removed policy falls back
+to the static dataset. Rolling back config must preserve keys/journals and the
+chosen immutable revision; do not relabel changed files as an old revision.
+
+## Automated verification
+
+```sh
+swift test --disable-automatic-resolution --filter PolicyIsolationTests
+swift test --disable-automatic-resolution
+```
+
+The outer tests perform real blinded-token issuance and encrypted PIR queries.
+They verify two policies with the **same OS identifier and crypto parameters**,
+separate evaluation keys and plaintext results, cross-policy config rejection,
+old-version retry and retirement, revision collision rejection, concurrent token
+replay, full-key-ID tampering, persistent nonce recovery, unsupported API
+rejection, and external artifact/Bloom mismatch without replacing working state.
+No physical devices, Apple relay, or new filtering observations are involved.
+
+---
+
 # PIR Service Example
 
 [Live Caller ID

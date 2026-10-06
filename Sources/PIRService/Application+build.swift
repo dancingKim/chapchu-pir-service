@@ -25,6 +25,7 @@ struct AppContext: IdentifiedRequestContext, PlatformRequestContext, RequestCont
     var coreContext: CoreRequestContextStorage
     var userIdentifier: UserIdentifier
     var platform: Platform?
+    var policyID: String = ""
 
     /// override upload size to 10MiB, the default 2MiB limit is too small for some evaluation keys.
     var maxUploadSize: Int {
@@ -57,7 +58,10 @@ func buildApplication(
     router.middlewares.add(LogRequestsMiddleware(.info, includeHeaders: .none))
     router.middlewares.add(LogErrorsMiddleware())
 
-    let pirServiceController = PIRServiceController(usecases: usecaseStore, evaluationKeyStore: evaluationKeyStore)
+    let pirServiceController = PIRServiceController(
+        usecases: usecaseStore,
+        evaluationKeyStore: evaluationKeyStore,
+        privacyPassState: privacyPassState)
     pirServiceController.addUnauthRoutes(to: router.group())
     let pirGroup = router.group()
     // The report endpoint lives in its own group so it inherits PrivacyPass authentication (when configured) but

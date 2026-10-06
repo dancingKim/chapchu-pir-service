@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import Crypto
 import Foundation
 import Logging
+import PrivacyPass
 import PrivateInformationRetrieval
 import ServiceLifecycle
 import UnixSignals
@@ -51,8 +53,21 @@ struct ServerConfiguration: Codable {
         let shardCount: Int
         let versionCount: Int?
         let symmetricPirArguments: SymmetricPirArguments?
+        var revision: String?
+        var artifactSHA256: String?
+        var bloomFile: String?
+        var bloomSHA256: String?
     }
 
+    struct Policy: Codable {
+        let id: String
+        let bearerTokenFile: String
+        let privateKeyFile: String
+        let nonceFile: String
+        let usecases: [Usecase]
+    }
+
+    var profiles: [Policy]?
     let issuerRequestUri: String?
     let reportDirectory: String?
     let tokens: [String]
@@ -92,8 +107,7 @@ actor ReloadService: Service {
                 try await reloadConfiguration()
                 logger.info("Reloading configuration completed.")
             } catch {
-                logger.error("Failed to reload configuration: \(error.localizedDescription).")
-                logger.error("Service state might have been partially updated.")
+                logger.error("Configuration reload failed; policy snapshot unchanged.")
             }
         }
     }
@@ -101,6 +115,13 @@ actor ReloadService: Service {
     func reloadConfiguration() async throws {
         let configData = try Data(contentsOf: configFile)
         let config = try JSONDecoder().decode(ServerConfiguration.self, from: configData)
+
+        if let profiles = config.profiles {
+            try await reloadPolicies(profiles, legacyTokens: config.tokens, legacyUsecases: config.usecases,
+                                     reportDirectory: config.reportDirectory)
+            return
+        }
+        guard await !privacyPassState.policyIsolation else { throw PolicyConfigurationError.invalid }
 
         await privacyPassState.update(allowList: Set(config.tokens))
         await reportStore.set(reportDirectory: config.reportDirectory)
@@ -116,5 +137,79 @@ actor ReloadService: Service {
             let loaded = try loadUsecase(usecase: usecase)
             try await usecaseStore.set(name: usecase.name, usecase: loaded, versionCount: versionCount)
         }
+    }
+
+    private func reloadPolicies(_ profiles: [ServerConfiguration.Policy], legacyTokens: [String],
+                                legacyUsecases: [ServerConfiguration.Usecase], reportDirectory: String?) async throws
+    {
+        // Never mix a global fallback or plaintext URL reporting into isolated mode.
+        guard legacyTokens.isEmpty, legacyUsecases.isEmpty, reportDirectory == nil else {
+            throw PolicyConfigurationError.invalid
+        }
+        var credentials: [PolicyCredential] = []
+        var datasets: [PolicyDataset] = []
+        var noncePaths = Set<String>()
+        for profile in profiles {
+            guard !profile.usecases.isEmpty, noncePaths.insert(profile.nonceFile).inserted else {
+                throw PolicyConfigurationError.invalid
+            }
+            for path in [profile.bearerTokenFile, profile.privateKeyFile] {
+                let attributes = try FileManager.default.attributesOfItem(atPath: path)
+                guard let permissions = attributes[.posixPermissions] as? NSNumber,
+                      permissions.intValue & 0o077 == 0 else { throw PolicyConfigurationError.invalid }
+            }
+            let bearer = try String(contentsOfFile: profile.bearerTokenFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let pem = try String(contentsOfFile: profile.privateKeyFile, encoding: .utf8)
+            let issuer = try PrivacyPass.Issuer(privateKey: .init(pemRepresentation: pem))
+            let existingStore = await privacyPassState.nonceStore(for: issuer.publicKey.tokenKeyId)
+            if let existingStore, existingStore.path != profile.nonceFile {
+                throw PolicyConfigurationError.invalid
+            }
+            let binding = PolicyUsecase.digest([Data(profile.id.utf8), Data(issuer.publicKey.tokenKeyId)])
+            let nonceStore = try existingStore ?? PolicyNonceStore(path: profile.nonceFile, binding: binding)
+            credentials.append(.init(id: profile.id, bearer: bearer, issuer: issuer, nonceStore: nonceStore))
+            var names = Set<String>()
+            for usecase in profile.usecases {
+                guard names.insert(usecase.name).inserted, let revision = usecase.revision,
+                      let expected = usecase.artifactSHA256, let bloomFile = usecase.bloomFile,
+                      let expectedBloom = usecase.bloomSHA256,
+                      usecase.shardCount > 0, (1...8).contains(usecase.versionCount ?? 2)
+                else {
+                    throw PolicyConfigurationError.invalid
+                }
+                let before = try artifactDigest(usecase)
+                let bloomDigest = try Data(SHA256.hash(data: Data(contentsOf: URL(fileURLWithPath: bloomFile))))
+                guard before.hex == expected.lowercased(), bloomDigest.hex == expectedBloom.lowercased() else {
+                    throw PolicyConfigurationError.invalid
+                }
+                let loaded = try loadUsecase(usecase: usecase)
+                guard try artifactDigest(usecase) == before else { throw PolicyConfigurationError.invalid }
+                let wrapped = try PolicyUsecase(base: loaded, policyID: profile.id, name: usecase.name,
+                                                revision: revision, artifactDigest: before, bloomDigest: bloomDigest)
+                datasets.append(.init(policyID: profile.id, name: usecase.name, usecase: wrapped,
+                                      versionCount: usecase.versionCount ?? 2))
+            }
+        }
+        try await privacyPassState.validate(credentials)
+        try await usecaseStore.installPolicies(datasets)
+        await privacyPassState.install(credentials)
+    }
+
+    private func artifactDigest(_ usecase: ServerConfiguration.Usecase) throws -> Data {
+        // Immutable revision files; ordered, length-framed SHA256 matches PolicyUsecase.digest.
+        var fields: [Data] = []
+        for shard in 0..<usecase.shardCount {
+            for suffix in ["params.txtpb", "bin"] {
+                try fields.append(Data(contentsOf: URL(fileURLWithPath: "\(usecase.fileStem)-\(shard).\(suffix)")))
+            }
+        }
+        return PolicyUsecase.digest(fields)
+    }
+}
+
+private extension Data {
+    var hex: String {
+        map { String(format: "%02x", $0) }.joined()
     }
 }

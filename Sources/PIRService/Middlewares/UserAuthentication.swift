@@ -15,31 +15,23 @@
 import HTTPTypes
 import Hummingbird
 
-struct AuthenticateUserMiddleware<Context: RequestContext>: RouterMiddleware {
+struct AuthenticateUserMiddleware: RouterMiddleware {
     let state: PrivacyPassState
-
-    init(_: Context.Type, state: PrivacyPassState) {
+    init(_: AppContext.Type, state: PrivacyPassState) {
         self.state = state
     }
 
-    func handle(_ input: Request, context: Context,
-                next: (Request, Context) async throws -> Response) async throws -> Response
+    func handle(_ input: Request, context: AppContext,
+                next: (Request, AppContext) async throws -> Response) async throws -> Response
     {
-        context.logger.info("Authenticating request")
-        guard let token = try input.headers.privateToken() else {
-            throw HTTPError(.unauthorized, message: "No private token")
-        }
-
-        guard let truncatedKeyId = token.tokenKeyId.last,
-              let verifier = await state.verifiers[truncatedKeyId]
-        else {
-            throw HTTPError(.unauthorized, message: "No token key found with key id: \(token.tokenKeyId)")
-        }
-
-        guard try await verifier.verify(token: token) else {
-            throw HTTPError(.unauthorized, message: "Token did not pass verification")
-        }
-
-        return try await next(input, context)
+        let policyID: String
+        do {
+            guard let token = try input.headers.privateToken(),
+                  let verified = try await state.verify(token) else { throw HTTPError(.unauthorized) }
+            policyID = verified
+        } catch { throw HTTPError(.unauthorized, message: "Private token is unauthorized") }
+        var authenticated = context
+        authenticated.policyID = policyID
+        return try await next(input, authenticated)
     }
 }

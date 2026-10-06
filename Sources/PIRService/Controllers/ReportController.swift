@@ -26,6 +26,9 @@ struct ReportController {
 
     @Sendable
     func report(_ request: Request, context: AppContext) async throws -> Response {
+        guard context.policyID.isEmpty else { throw HTTPError(
+            .notImplemented,
+            message: "Policy URL reports are disabled") }
         let timestamp = Google_Protobuf_Timestamp(date: .now)
 
         let receivedReport: URLFilterReport
